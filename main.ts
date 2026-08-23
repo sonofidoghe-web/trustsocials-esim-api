@@ -1,5 +1,5 @@
 // main.ts
-// Trust Social - Deno eSIM API Proxy (fixed)
+// Trust Social - Deno API Proxy (eSIM + Proxies)
 
 const PDSBOOST_URL =
   Deno.env.get("PDSBOOST_API_URL") ||
@@ -78,13 +78,11 @@ async function pdsboostRequest(
   try {
     data = JSON.parse(text);
   } catch {
-    // Provider returned non-JSON
     throw new Error(
       `Provider returned non-JSON (HTTP ${response.status}): ${text.slice(0, 200)}`,
     );
   }
 
-  // Many Nigerian APIs return HTTP 200 even on logical errors
   if (data?.success === false || data?.status === false || data?.error) {
     throw new Error(
       data.error || data.message || data.msg || "Provider returned an error",
@@ -108,7 +106,7 @@ function extractArray(data: any, keys: string[]) {
 }
 
 // --------------------------------------------------
-// Routes
+// eSIM ROUTES
 // --------------------------------------------------
 
 async function getCountries() {
@@ -162,7 +160,7 @@ async function getPlans(request: Request) {
   });
 }
 
-// Poll status until QR / LPA / ICCID appear (or timeout)
+// Poll status until QR / LPA / ICCID appear
 async function pollOrder(orderId: string, maxAttempts = 12) {
   for (let i = 0; i < maxAttempts; i++) {
     const statusData = await pdsboostRequest("status", { order: orderId });
@@ -185,11 +183,9 @@ async function pollOrder(orderId: string, maxAttempts = 12) {
       return { ...statusData, qr, lpa, iccid, order: orderId };
     }
 
-    // wait 2 seconds before next poll
     await new Promise((r) => setTimeout(r, 2000));
   }
 
-  // return whatever we have after timeout
   return await pdsboostRequest("status", { order: orderId });
 }
 
@@ -213,7 +209,6 @@ async function buyEsim(request: Request) {
     return errorResponse("eSIM package is required.");
   }
 
-  // 1. Place the order
   const buyData = await pdsboostRequest("esim_buy", {
     package: packageId,
   });
@@ -226,7 +221,6 @@ async function buyEsim(request: Request) {
     "";
 
   if (!orderId) {
-    // Some providers return everything immediately
     return json({
       success: true,
       order: "",
@@ -240,7 +234,6 @@ async function buyEsim(request: Request) {
     });
   }
 
-  // 2. Poll until delivery details appear
   const finalData = await pollOrder(String(orderId));
 
   return json({
@@ -265,10 +258,72 @@ async function buyEsim(request: Request) {
   });
 }
 
+// --------------------------------------------------
+// PROXY ROUTES
+// --------------------------------------------------
+
+async function getProxyList() {
+  const data = await pdsboostRequest("proxy_list");
+
+  const products = extractArray(data, [
+    "products",
+    "data",
+    "list",
+    "items",
+    "proxies",
+  ]);
+
+  return json({
+    success: true,
+    products,
+    data: products,
+    provider: data,
+  });
+}
+
+async function buyProxy(request: Request) {
+  let body: any = {};
+  try {
+    body = await request.json();
+  } catch {
+    return errorResponse("Invalid JSON body.");
+  }
+
+  const product = body.product || body.productId || "";
+  const plan = body.plan || body.planId || "";
+  const location = body.location || body.country || body.loc || "";
+  const quantity = Number(body.quantity || body.qty || 1);
+
+  if (!product) return errorResponse("Product is required.");
+  if (!plan) return errorResponse("Plan is required.");
+  if (!location) return errorResponse("Location is required.");
+  if (quantity < 1) return errorResponse("Quantity must be at least 1.");
+
+  const data = await pdsboostRequest("proxy_buy", {
+    product,
+    plan,
+    location,
+    quantity,
+  });
+
+  return json({
+    success: true,
+    order: data.order || data.order_id || data.orderId || "",
+    order_id: data.order_id || data.orderId || data.order || "",
+    proxies: data.proxies || data.proxy || data.list || data.data || [],
+    message: data.message || "Proxy purchase completed.",
+    provider: data,
+  });
+}
+
+// --------------------------------------------------
+// HEALTH CHECK
+// --------------------------------------------------
+
 function healthCheck() {
   return json({
     success: true,
-    service: "Trust Social eSIM API",
+    service: "Trust Social API",
     status: "online",
     hasKey: Boolean(PDSBOOST_KEY),
     routes: [
@@ -276,12 +331,14 @@ function healthCheck() {
       "POST /esim/countries",
       "POST /esim/plans",
       "POST /esim/buy",
+      "POST /proxies/list",
+      "POST /proxies/buy",
     ],
   });
 }
 
 // --------------------------------------------------
-// Server
+// SERVER
 // --------------------------------------------------
 
 Deno.serve({ port: PORT }, async (request) => {
@@ -299,6 +356,7 @@ Deno.serve({ port: PORT }, async (request) => {
       return healthCheck();
     }
 
+    // ===== eSIM =====
     if (request.method === "POST" && url.pathname === "/esim/countries") {
       return await getCountries();
     }
@@ -309,6 +367,15 @@ Deno.serve({ port: PORT }, async (request) => {
 
     if (request.method === "POST" && url.pathname === "/esim/buy") {
       return await buyEsim(request);
+    }
+
+    // ===== PROXIES =====
+    if (request.method === "POST" && url.pathname === "/proxies/list") {
+      return await getProxyList();
+    }
+
+    if (request.method === "POST" && url.pathname === "/proxies/buy") {
+      return await buyProxy(request);
     }
 
     return errorResponse("Route not found.", 404);
